@@ -24,8 +24,9 @@ const server = http.createServer((req, res) => {
     const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
-    await page.goto(`http://127.0.0.1:${server.address().port}/recruit/`);
+    await page.goto(`http://127.0.0.1:${server.address().port}/`);
     await page.waitForSelector('#tagList .button', { state: 'attached' });
+    assert.equal(new URL(page.url()).pathname, '/', 'the calculator opens at the root without redirecting');
     assert.equal(await page.evaluate(() => typeof Tesseract), 'undefined', 'OCR must be lazy-loaded');
     assert.equal(await page.locator('#tagList').isVisible(), true);
     assert.equal(await page.locator('#tagInput').isDisabled(), false);

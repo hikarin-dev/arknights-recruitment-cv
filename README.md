@@ -12,7 +12,7 @@ copyright and MIT license notices are retained in `LICENSE`.
 
 Open this repository in VS Code and click **Go Live** with the Live Server
 extension installed. The port is configured in `.vscode/settings.json` (currently
-**5005**). Visit http://localhost:5005/recruit/; the homepage also redirects there.
+**5005**). Visit http://localhost:5005/ to open the calculator directly.
 If Live Server is already running, stop it and click Go Live again.
 
 No build step or package installation is required. An internet connection is
