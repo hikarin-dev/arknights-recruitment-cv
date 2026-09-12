@@ -1,0 +1,11 @@
+{
+  "name": "arknights-recruitment-calculator",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/recruitment.test.cjs",
+    "test:browser": "node tests/browser.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
+  }
+}
