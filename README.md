@@ -86,25 +86,38 @@ game: its screenshot and five tags update automatically, with the same dimming,
 bright tag buttons, and recommendations as pasted screenshots. Choose the game
 window itself so the capture does not include the calculator on top of it.
 
-Once the five buttons are located, the tool watches tiny 16×8 color samples at
-their positions (640 pixels total), up to ten times per second as capture frames
-arrive. Changes trigger a full grid check; all five buttons changing color and
-returning also trigger fresh validation. A full scan about once a second catches
-subtle text changes or a moved grid. A 250 ms timer keeps checking when video-frame
-callbacks are unavailable. Two matching grids at least 150 ms apart are required
-before OCR; a transition alone never replaces the displayed screenshot.
-Recognition runs one image
-at a time and compares the recognized tag IDs before committing an update, so
-animation or styling changes do not refresh the displayed input. If the recruitment
-screen disappears, old selections, screenshots, and highlights remain available
-for reference; if recognition fails, the tool retries after five seconds. The
-background is a snapshot of the last recognized grid, not a continuous video.
+Once the five buttons are located, the tool tracks both their background colors
+and letter shapes in five 128×40 crops, up to twenty times per second as capture
+frames arrive. Comparing the text itself catches a single short tag changing even
+when the average button color barely changes. Full-screen detection runs
+when the grid is lost, when reacquiring a failed crop, on window switches, or about
+every 750 ms to check geometry. An 80 ms timer covers still frames or unavailable video-frame
+callbacks. Matching text must remain stable for at least 100 ms before recognition.
+Even apparently unchanged text is rechecked about 750 ms after a successful read,
+so a missed pixel transition cannot indefinitely suppress newer tags.
+
+Capture tracking continues during OCR. If the game changes again, the unfinished
+result is discarded and the newest stable grid is read next, without queuing
+intermediate screenshots. Live pixels are checked again before applying a result.
+Only five distinct, confidently recognized tags that differ from the last set
+replace the screenshot and results. Opening another screen keeps the old input
+available for reference.
+
+OCR starts loading when you open the sharing picker. A bounded in-memory cache
+reuses exact binary tag images previously read with high confidence; changing one
+tag can reuse the other four. Hash matches are also checked against every packed
+pixel. Full-resolution screenshots are encoded only when different tags have been
+confirmed, and live captures reuse the detector's button coordinates instead of
+running detection a second time. Failed reads retry after 200 ms, with increasing
+delays capped at 1.6 seconds; different input resets the delay. The background is
+a snapshot of the last recognized grid, not a continuous video.
 Keep the game window open: capture of minimized windows can pause depending on
 the browser and operating system.
 
 Switching away from or returning to the calculator, changing tab visibility, or
-resuming a paused capture triggers an immediate check. Checks during OCR are
-combined into one follow-up, so they cannot build a processing queue. The website
+resuming a paused capture triggers an immediate geometry and tag check, followed
+by tag verification about every 250 ms for 1.5 seconds to catch delayed capture
+frames. The website
 can detect its own focus and visibility, but cannot monitor clicks in other apps
 or determine which native app is active. Browser background throttling can still
 delay checks, and first-use OCR model loading adds time. These intervals are
@@ -113,7 +126,10 @@ scheduling targets, not guaranteed response times.
 Click **Stop sharing** to end capture and keep the last screenshot. The browser's
 own **Stop sharing** button does the same. Switching to manual input, clearing the
 screenshot, pasting an image, or leaving the page also stops capture. Stopping
-capture does not exit fullscreen. Background clicks do not read the clipboard
+capture does not exit fullscreen. While sharing, clicking the background forces
+a fresh capture and tag search, bypassing cached recognition as a manual fallback.
+If a read is already running, its result is discarded and the latest stable frame
+is read next. Background clicks do not read the clipboard
 while screen sharing is active.
 
 This uses the browser's
@@ -136,6 +152,12 @@ Set `BROWSER_CHANNEL=msedge` to use Edge instead. Browser tests use a temporary 
 and an isolated clipboard stub; they do not replace your system clipboard.
 Screen-sharing tests use a canvas video stream and a simulated picker, so they
 exercise real video-frame processing without capturing your desktop.
+
+`npm run test:performance` measures capture-to-recognition scheduling using a real
+canvas video stream with repeated single-tag changes. It reports timings and full
+scan counts; OCR is stubbed in this benchmark to isolate capture overhead. The
+browser suite separately checks real OCR, cache reuse, changing inputs during a
+blocked recognition job, stale-result rejection, and failed-read retries.
 
 Credits:
 

@@ -1,33 +1,16 @@
-/* Sample the selected window locally. Only stable, changed tag grids reach OCR. */
+/* Track button text continuously; periodically verify even apparently unchanged grids. */
 window.RecruitScreenShare = function ({ button, onRequest, onStart, onFrame, onMissing, onStop, onStatus }) {
+  const CHECK_INTERVAL = 50, FALLBACK_INTERVAL = 80, SETTLE_INTERVAL = 100, RESCAN_INTERVAL = 750;
+  const VERIFY_INTERVAL = 750, WAKE_VERIFY_INTERVAL = 250, WAKE_DURATION = 1500;
   let session = 0, state = 'idle', stream, video, timer, frameCallback;
-  let pending, accepted, lastAttempt = 0, missing = false;
-  let missingFrames = 0;
-  let samplingSession, wakeRequested = false, lastCheck = 0, lastDetection = 0, confirming = false;
-  let probeGrid, probePrevious, probeAnchor, transitionAway = false;
-  const CHECK_INTERVAL = 100, FALLBACK_INTERVAL = 250, SETTLE_INTERVAL = 150, RESCAN_INTERVAL = 1000;
-  const frame = document.createElement('canvas');
+  let grid, pending, accepted, inFlight, revision = 0;
+  let lastCheck = -Infinity, lastDetection = -Infinity, retryAt = 0, failures = 0;
+  let verifyAt = 0, wakeUntil = 0;
+  let manualRefresh = false;
+  let missingSince, missingReported = false;
   const preview = document.createElement('canvas');
-  const probeCanvas = document.createElement('canvas');
-  probeCanvas.width = 16 * 5; probeCanvas.height = 8;
   const signatureCanvas = document.createElement('canvas');
-  signatureCanvas.width = 128; signatureCanvas.height = 40;
-
-  function stop() {
-    const wasActive = state !== 'idle';
-    session++;
-    state = 'idle';
-    cancelScheduled();
-    if (stream) stream.getTracks().forEach(track => track.stop());
-    if (video) { video.pause(); video.srcObject = null; }
-    stream = video = undefined;
-    pending = accepted = undefined;
-    probeGrid = probePrevious = probeAnchor = undefined;
-    transitionAway = confirming = wakeRequested = false;
-    button.setAttribute('aria-pressed', 'false');
-    button.textContent = 'Screen share';
-    if (wasActive) onStop();
-  }
+  signatureCanvas.width = 128 * 5; signatureCanvas.height = 40;
 
   function cancelScheduled() {
     clearTimeout(timer);
@@ -35,9 +18,22 @@ window.RecruitScreenShare = function ({ button, onRequest, onStart, onFrame, onM
     frameCallback = undefined;
   }
 
+  function stop() {
+    const wasActive = state !== 'idle';
+    session++; revision++;
+    state = 'idle';
+    cancelScheduled();
+    if (stream) stream.getTracks().forEach(track => track.stop());
+    if (video) { video.pause(); video.srcObject = null; }
+    stream = video = grid = pending = accepted = inFlight = undefined;
+    manualRefresh = false;
+    button.setAttribute('aria-pressed', 'false');
+    button.textContent = 'Screen share';
+    if (wasActive) onStop();
+  }
+
   function schedule(token) {
-    // Fresh video frames drive the cheap checks. A timer also covers still frames,
-    // suspended video callbacks and browsers without requestVideoFrameCallback.
+    // Timers cover still frames and unavailable/throttled video callbacks.
     const watchFrame = () => {
       if (!video?.requestVideoFrameCallback) return;
       frameCallback = video.requestVideoFrameCallback(() => {
@@ -52,155 +48,180 @@ window.RecruitScreenShare = function ({ button, onRequest, onStart, onFrame, onM
   }
 
   function wake() {
-    if (state === 'active') sample(session, true);
+    if (state !== 'active') return;
+    // The first frame after focus/unmute can still be the old frame. Keep
+    // verifying briefly afterwards, even if the pixel comparison sees no change.
+    wakeUntil = performance.now() + WAKE_DURATION;
+    verifyAt = retryAt = 0;
+    sample(session, true);
   }
 
-  function readProbe(source) {
-    const ctx = probeCanvas.getContext('2d', { willReadFrequently: true });
-    probeGrid.boxes.forEach((box, i) => {
-      ctx.drawImage(source, box.x, box.y, box.width, box.height, i * 16, 0, 16, 8);
-    });
-    return ctx.getImageData(0, 0, 80, 8).data;
+  function refresh() {
+    if (state !== 'active') return;
+    // Invalidate any older OCR result, then read the latest stable frame from
+    // scratch. Repeated clicks coalesce into one request behind the active job.
+    revision++;
+    manualRefresh = true;
+    grid = pending = accepted = undefined;
+    lastDetection = -Infinity;
+    failures = 0;
+    onStatus('Checking the shared window again…');
+    wake();
   }
 
-  function changedButtons(a, b, threshold) {
-    if (!a || !b) return 5;
-    let changed = 0;
-    for (let tag = 0; tag < 5; tag++) {
-      let difference = 0;
-      for (let y = 0; y < 8; y++) for (let x = 0; x < 16; x++) {
-        const i = (y * 80 + tag * 16 + x) * 4;
-        for (let channel = 0; channel < 3; channel++) difference += Math.abs(a[i + channel] - b[i + channel]);
-      }
-      if (difference / (16 * 8 * 3) > threshold) changed++;
-    }
-    return changed;
+  function locate() {
+    // Downsample directly, without first copying or encoding a full-size image.
+    const width = Math.min(1280, video.videoWidth);
+    const height = Math.round(video.videoHeight * width / video.videoWidth);
+    if (preview.width !== width || preview.height !== height) { preview.width = width; preview.height = height; }
+    const ctx = preview.getContext('2d', { willReadFrequently: true });
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(video, 0, 0, width, height);
+    const boxes = RecruitVision.detectButtons(ctx.getImageData(0, 0, width, height));
+    lastDetection = performance.now();
+    if (boxes.length !== 5) return null;
+    return { width: video.videoWidth, height: video.videoHeight, boxes: boxes.map(box => ({
+      x: box.x * video.videoWidth / width, y: box.y * video.videoHeight / height,
+      width: box.width * video.videoWidth / width, height: box.height * video.videoHeight / height,
+    })) };
   }
 
-  function fingerprint(boxes) {
+  function fingerprint(layout) {
     const ctx = signatureCanvas.getContext('2d', { willReadFrequently: true });
-    const pixels = new Uint8Array(128 * 40 * 5);
-    boxes.forEach((box, index) => {
-      ctx.drawImage(preview, box.x + box.width * 0.04, box.y + box.height * 0.12,
-        box.width * 0.92, box.height * 0.76, 0, 0, 128, 40);
-      const data = ctx.getImageData(0, 0, 128, 40).data;
-      for (let i = 0; i < 128 * 40; i++) {
-        pixels[index * 128 * 40 + i] = data[i * 4] * 0.299 + data[i * 4 + 1] * 0.587 + data[i * 4 + 2] * 0.114 > 175 ? 1 : 0;
-      }
+    ctx.clearRect(0, 0, 640, 40);
+    layout.boxes.forEach((box, i) => {
+      ctx.drawImage(video, box.x + box.width * 0.04, box.y + box.height * 0.12,
+        box.width * 0.92, box.height * 0.76, i * 128, 0, 128, 40);
     });
-    return { pixels, boxes, width: frame.width, height: frame.height, observedAt: lastCheck };
+    // One readback for all five crops. A short word changing must not disappear
+    // into the average color of an otherwise unchanged button.
+    const data = ctx.getImageData(0, 0, 640, 40).data;
+    const pixels = new Uint8Array(128 * 40 * 5), ink = new Uint16Array(5);
+    let valid = true;
+    for (let tag = 0; tag < 5; tag++) {
+      let background = 0;
+      for (let y = 0; y < 40; y++) for (let x = 0; x < 128; x++) {
+        const i = (y * 640 + tag * 128 + x) * 4;
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        const light = r * 0.299 + g * 0.587 + b * 0.114 > 175 ? 1 : 0;
+        pixels[tag * 5120 + y * 128 + x] = light;
+        ink[tag] += light;
+        const dark = Math.max(r, g, b) < 110 && Math.min(r, g, b) > 15 && Math.max(r, g, b) - Math.min(r, g, b) < 28;
+        const blue = r < 70 && g > 90 && b > 135 && b > g;
+        background += dark || blue ? 1 : 0;
+      }
+      valid &&= background > 5120 * 0.5 && ink[tag] >= 8 && ink[tag] < 5120 * 0.4;
+    }
+    return { ...layout, pixels, ink, valid, observedAt: performance.now() };
   }
 
   function same(a, b) {
-    if (!a || !b || a.width !== b.width || a.height !== b.height) return false;
+    if (!a?.valid || !b?.valid || a.width !== b.width || a.height !== b.height) return false;
     if (a.boxes.some((box, i) => ['x', 'y', 'width', 'height'].some(key => Math.abs(box[key] - b.boxes[i][key]) > 2))) return false;
-    // Compare each button separately so a single changed short tag isn't diluted.
     for (let tag = 0; tag < 5; tag++) {
       let changed = 0;
       for (let i = tag * 5120; i < (tag + 1) * 5120; i++) changed += a.pixels[i] !== b.pixels[i];
-      if (changed / 5120 > 0.015) return false;
+      // Relative to text ink, not the much larger button background.
+      if (changed > Math.max(3, (a.ink[tag] + b.ink[tag]) * 0.025)) return false;
     }
     return true;
   }
 
   function markMissing(text) {
-    if (++missingFrames < 3) return;
-    if (!missing) {
-      pending = accepted = undefined;
-      missing = true;
+    if (pending) revision++;
+    pending = accepted = undefined;
+    missingSince ??= performance.now();
+    if (!missingReported && performance.now() - missingSince >= 600) {
+      missingReported = true;
       onMissing(text + ' Your previous screenshot is kept until different tags are confirmed.');
     }
   }
 
-  async function sample(token, force = false) {
+  function recognize(current, token) {
+    const job = { revision, token, forceRecognition: manualRefresh };
+    inFlight = job;
+    // Freeze this candidate while sampling continues on the live video.
+    const snapshot = document.createElement('canvas');
+    snapshot.width = current.width; snapshot.height = current.height;
+    snapshot.getContext('2d').drawImage(video, 0, 0);
+    const isCurrent = () => {
+      if (token !== session || state !== 'active' || job.revision !== revision ||
+          stream.getVideoTracks()[0]?.muted || video.readyState < 2 ||
+          video.videoWidth !== current.width || video.videoHeight !== current.height) return false;
+      // Recheck actual pixels at commit time, even after background throttling.
+      return same(current, fingerprint(current));
+    };
+    (async () => {
+      try {
+        const success = await onFrame(snapshot, { boxes: current.boxes, isCurrent, forceRecognition: job.forceRecognition });
+        if (!isCurrent()) return;
+        if (success) {
+          if (job.forceRecognition) manualRefresh = false;
+          accepted = current; failures = 0; retryAt = 0;
+          verifyAt = performance.now() + (performance.now() < wakeUntil ? WAKE_VERIFY_INTERVAL : VERIFY_INTERVAL);
+        }
+        else {
+          retryAt = performance.now() + Math.min(1600, 200 * 2 ** failures++);
+          // A crop may have moved within a same-size capture. Reacquire geometry
+          // before the first retry instead of waiting for the periodic scan.
+          if (failures === 1) lastDetection = -Infinity;
+        }
+      } catch {
+        if (token === session && job.revision === revision) {
+          retryAt = performance.now() + Math.min(1600, 200 * 2 ** failures++);
+          onStatus('Could not read all five tags yet. Your previous input is unchanged — I’ll try again shortly.');
+        }
+      } finally {
+        snapshot.width = snapshot.height = 1;
+        if (inFlight === job) inFlight = undefined;
+        // No frame queue: immediately consider the latest stable input.
+        if (token === session && state === 'active') sample(token);
+      }
+    })();
+  }
+
+  function sample(token, force = false) {
     if (token !== session || state !== 'active') return;
-    // Focus/visibility events can arrive together, including during an OCR job.
-    if (samplingSession === token) { wakeRequested ||= force; return; }
     cancelScheduled();
-    samplingSession = token;
     lastCheck = performance.now();
     try {
       if (stream.getVideoTracks()[0]?.muted || video.readyState < 2 || !video.videoWidth) {
         markMissing('Waiting for the game window. Keep it open so its tags can be read.');
         return;
       }
-      let changed = true;
-      if (probeGrid?.width === video.videoWidth && probeGrid?.height === video.videoHeight) {
-        // Just 640 pixels across the five known buttons; no full-size canvas copy,
-        // connected-component detection or OCR is needed for this fast path.
-        const colors = readProbe(video);
-        changed = changedButtons(colors, probePrevious, 6) > 0;
-        if (probeAnchor && changedButtons(colors, probeAnchor, 20) === 5) transitionAway = true;
-        if (transitionAway && changedButtons(colors, probeAnchor, 6) === 0) {
-          // All buttons disappeared/changed color and returned: validate again even
-          // if the fine fingerprint looks familiar. The tag-ID check still owns UI updates.
-          transitionAway = false;
-          pending = accepted = undefined;
-          lastAttempt = 0;
-          force = true;
+      if (grid?.width !== video.videoWidth || grid?.height !== video.videoHeight) grid = undefined;
+      let current = grid && fingerprint(grid);
+      if (force || !current?.valid || lastCheck - lastDetection >= RESCAN_INTERVAL) {
+        if (force || lastCheck - lastDetection >= FALLBACK_INTERVAL) {
+          const located = locate();
+          if (located) { grid = located; current = fingerprint(grid); }
+          else current = null;
         }
-        // Keep the last full scan as the reference so small changes can accumulate.
-        const elapsed = lastCheck - lastDetection;
-        if (!force && elapsed < RESCAN_INTERVAL && (!(changed || confirming) || elapsed < SETTLE_INTERVAL)) return;
-      } else {
-        probeGrid = probePrevious = probeAnchor = undefined;
-        transitionAway = false;
-        if (!force && lastCheck - lastDetection < FALLBACK_INTERVAL) return;
       }
-      lastDetection = lastCheck;
-      frame.width = video.videoWidth; frame.height = video.videoHeight;
-      frame.getContext('2d').drawImage(video, 0, 0);
-      const scale = Math.min(1, 1280 / frame.width);
-      preview.width = Math.round(frame.width * scale); preview.height = Math.round(frame.height * scale);
-      const ctx = preview.getContext('2d', { willReadFrequently: true });
-      ctx.drawImage(frame, 0, 0, preview.width, preview.height);
-      const boxes = RecruitVision.detectButtons(ctx.getImageData(0, 0, preview.width, preview.height));
-      if (boxes.length !== 5) {
-        confirming = false;
-        if (probeGrid) probePrevious = readProbe(frame);
+      if (!current?.valid) {
         markMissing('Open the recruitment screen in the shared game window. I’ll read the five tags automatically.');
         return;
       }
-      probeGrid = { width: frame.width, height: frame.height, boxes: boxes.map(box => ({
-        x: box.x * frame.width / preview.width, y: box.y * frame.height / preview.height,
-        width: box.width * frame.width / preview.width, height: box.height * frame.height / preview.height,
-      })) };
-      probePrevious = readProbe(frame);
-      probeAnchor ||= probePrevious;
-      missing = false; missingFrames = 0;
-      const current = fingerprint(boxes);
-      if (same(current, accepted)) { confirming = false; return; }
+      missingSince = undefined; missingReported = false;
       if (!same(current, pending)) {
+        revision++;
         pending = current;
-        lastAttempt = 0;
-        confirming = true;
+        failures = 0; retryAt = 0;
         return;
       }
-      // Duplicate focus events must not count as time for a grid to settle.
-      if (confirming && lastCheck - pending.observedAt < SETTLE_INTERVAL) return;
-      confirming = false;
-      if (Date.now() - lastAttempt < 5000) return;
-      lastAttempt = Date.now();
-      const blob = await new Promise(resolve => frame.toBlob(resolve, 'image/png'));
-      if (token !== session || !blob) return;
-      const success = await onFrame(blob);
-      if (token === session && success) {
-        accepted = current;
-        probeAnchor = probePrevious;
-        transitionAway = false;
-      }
+      // Pixel equality is only a fast path, never an indefinite veto on reading
+      // tags. Recognition checks the current full-resolution crops and can reuse
+      // exact cached tag images without rebuilding an unchanged result.
+      if (lastCheck - pending.observedAt < SETTLE_INTERVAL ||
+          (same(current, accepted) && lastCheck < verifyAt) || inFlight || lastCheck < retryAt) return;
+      recognize(current, token);
     } catch {
       if (token === session) {
         stop();
         onStatus('The shared window could not be read. Turn Screen share on to try again.');
       }
     } finally {
-      // Await each OCR job: frames cannot build up a queue while recognition runs.
-      if (samplingSession === token) samplingSession = undefined;
-      if (token === session && state === 'active') {
-        if (wakeRequested) { wakeRequested = false; sample(token, true); }
-        else schedule(token);
-      }
+      if (token === session && state === 'active') schedule(token);
     }
   }
 
@@ -211,16 +232,12 @@ window.RecruitScreenShare = function ({ button, onRequest, onStart, onFrame, onM
     }
     const token = ++session;
     state = 'starting';
-    button.setAttribute('aria-pressed', 'true');
-    button.textContent = 'Cancel sharing';
+    button.setAttribute('aria-pressed', 'true'); button.textContent = 'Cancel sharing';
     onStatus('Choose Window, then Arknights, and click Share. Your browser requires you to make this selection.');
     try {
-      // Invoke directly from the click gesture. The browser always owns the picker.
       const selection = navigator.mediaDevices.getDisplayMedia({
-        video: { displaySurface: 'window', frameRate: { ideal: 10, max: 10 } },
-        audio: false,
-        selfBrowserSurface: 'exclude',
-        surfaceSwitching: 'exclude',
+        video: { displaySurface: 'window', frameRate: { ideal: 20, max: 20 } },
+        audio: false, selfBrowserSurface: 'exclude', surfaceSwitching: 'exclude',
       });
       onRequest();
       const selected = await selection;
@@ -235,10 +252,11 @@ window.RecruitScreenShare = function ({ button, onRequest, onStart, onFrame, onM
       await video.play();
       if (token !== session) return;
       state = 'active';
-      missing = false; missingFrames = 0; pending = accepted = undefined; lastAttempt = 0;
+      grid = pending = accepted = undefined;
       lastCheck = lastDetection = -Infinity;
-      confirming = wakeRequested = transitionAway = false;
-      probeGrid = probePrevious = probeAnchor = undefined;
+      retryAt = failures = 0; missingSince = undefined; missingReported = false;
+      verifyAt = wakeUntil = 0;
+      manualRefresh = false;
       button.textContent = 'Stop sharing';
       onStart();
       onStatus('Screen share is on. Open the recruitment screen in the game and I’ll read its tags automatically.');
@@ -257,5 +275,5 @@ window.RecruitScreenShare = function ({ button, onRequest, onStart, onFrame, onM
   window.addEventListener('blur', wake);
   document.addEventListener('visibilitychange', wake);
   window.addEventListener('pagehide', stop);
-  return { stop, get active() { return state !== 'idle'; } };
+  return { stop, refresh, get active() { return state !== 'idle'; } };
 };

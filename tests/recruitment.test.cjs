@@ -1,9 +1,34 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { rank } = require('../js/recruit-ranking.js');
-const { matchTag, detectButtons } = require('../js/recruit-vision.js');
+const { matchTag, detectButtons, createTagCache } = require('../js/recruit-vision.js');
 
 const group = (name, rarities) => ({ tags: [{ tagName: name }], matches: rarities.map(rarity => ({ rarity })) });
+
+test('tag cache requires identical dimensions and packed pixels, including on hash collisions', () => {
+  const cache = createTagCache();
+  const image = { width: 8, height: 1, data: new Uint8Array(32).fill(255) };
+  image.data[0] = 0;
+  const a = cache.signature(image);
+  cache.set(a, 'Guard');
+  assert.equal(cache.get(cache.signature(image)), 'Guard');
+  image.data[4] = 0;
+  const b = cache.signature(image);
+  assert.equal(cache.get(b), undefined);
+  assert.equal(cache.get({ ...b, key: a.key }), undefined, 'hash collisions cannot select the wrong tag');
+  assert.equal(cache.get(cache.signature({ ...image, width: 4, height: 2 })), undefined);
+});
+
+test('tag cache evicts the least recently used entry at its memory bound', () => {
+  const cache = createTagCache(2);
+  const a = { key: 'a', bits: new Uint8Array([1]) }, b = { key: 'b', bits: new Uint8Array([2]) }, c = { key: 'c', bits: new Uint8Array([3]) };
+  cache.set(a, 'A'); cache.set(b, 'B');
+  assert.equal(cache.get(a), 'A');
+  cache.set(c, 'C');
+  assert.equal(cache.get(b), undefined);
+  assert.equal(cache.get(a), 'A');
+  assert.equal(cache.get(c), 'C');
+});
 
 test('guaranteed 6 stars outrank 5, mixed 4/5, and 4; pool sizes do not imply odds', () => {
   const six = group('Top Operator', [5]);

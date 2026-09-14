@@ -80,7 +80,34 @@
     return best.error <= limit ? { ...best.tag, exact: best.error === 0 } : null;
   }
 
-  const api = { detectButtons, matchTag, normalize };
+  function createTagCache(limit = 128) {
+    const entries = new Map();
+    function signature(image) {
+      const bits = new Uint8Array(Math.ceil(image.width * image.height / 8));
+      for (let i = 0; i < image.width * image.height; i++) {
+        if (image.data[i * 4] < 128) bits[i >> 3] |= 1 << (i & 7);
+      }
+      let hash = 2166136261;
+      for (const byte of bits) hash = Math.imul(hash ^ byte, 16777619) >>> 0;
+      return { key: `${image.width}:${image.height}:${hash}`, bits };
+    }
+    return {
+      signature,
+      get({ key, bits }) {
+        const entry = entries.get(key);
+        // Verify every packed pixel too: a hash collision must never select a tag.
+        if (!entry || entry.bits.length !== bits.length || !bits.every((v, i) => v === entry.bits[i])) return;
+        entries.delete(key); entries.set(key, entry);
+        return entry.value;
+      },
+      set({ key, bits }, value) {
+        entries.delete(key); entries.set(key, { bits: bits.slice(), value });
+        if (entries.size > limit) entries.delete(entries.keys().next().value);
+      },
+    };
+  }
+
+  const api = { detectButtons, matchTag, normalize, createTagCache };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.RecruitVision = api;
 })(globalThis);

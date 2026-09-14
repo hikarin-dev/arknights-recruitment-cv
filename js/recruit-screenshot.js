@@ -14,6 +14,7 @@
   let recognized = [], bestGroups = [], queue = Promise.resolve();
   let tagBoxes = [];
   let fullscreenPending = false;
+  const tagCache = RecruitVision.createTagCache();
   const controls = 'button, a, input, textarea, select, label, summary, [role="button"], [contenteditable], .button, .operatorCheckbox, .nav-dropdown, .hotkeys-icon, #reset';
   const pasteInstructions = 'Copy a recruitment screenshot, then click anywhere on the background to paste it. You can also press Ctrl+V.';
 
@@ -153,49 +154,65 @@
     message(enabled ? pasteInstructions : 'Screenshot input is off. Click the tags below to choose them yourself.');
   }
 
-  async function processImage(blob, live = false) {
+  async function processImage(input, live = false, capture) {
     const token = ++generation;
+    const isCurrent = () => token === generation && (!capture || capture.isCurrent());
     if (!enabled) setInputMode(true);
     const progress = text => { if (!live || !objectURL) message(text); };
     progress('Opening screenshot…');
     let bitmap;
     try {
-      bitmap = await createImageBitmap(blob);
-      if (token !== generation) return bitmap.close();
+      bitmap = capture ? input : await createImageBitmap(input);
+      if (!isCurrent()) return;
       // Stage the candidate locally. Keep the displayed screenshot and results intact.
       progress('Finding the five tag buttons…');
-      const scale = Math.min(1, 1280 / bitmap.width);
-      const small = canvas(bitmap.width * scale, bitmap.height * scale);
-      const ctx = small.getContext('2d', { willReadFrequently: true });
-      ctx.drawImage(bitmap, 0, 0, small.width, small.height);
-      const detected = RecruitVision.detectButtons(ctx.getImageData(0, 0, small.width, small.height));
-      if (detected.length !== 5) throw new Error('Could not find all five tag buttons. Your previous input is unchanged. Try a screenshot showing the whole recruitment screen, or turn Screenshot input off to choose the tags yourself.');
-      const boxes = detected.map(box => ({ x: box.x / scale, y: box.y / scale, width: box.width / scale, height: box.height / scale }));
+      let boxes = capture?.boxes;
+      if (!boxes) {
+        const scale = Math.min(1, 1280 / bitmap.width);
+        const small = canvas(bitmap.width * scale, bitmap.height * scale);
+        const ctx = small.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(bitmap, 0, 0, small.width, small.height);
+        const detected = RecruitVision.detectButtons(ctx.getImageData(0, 0, small.width, small.height));
+        if (detected.length !== 5) throw new Error('Could not find all five tag buttons. Your previous input is unchanged. Try a screenshot showing the whole recruitment screen, or turn Screenshot input off to choose the tags yourself.');
+        boxes = detected.map(box => ({ x: box.x * bitmap.width / small.width, y: box.y * bitmap.height / small.height, width: box.width * bitmap.width / small.width, height: box.height * bitmap.height / small.height }));
+      }
       progress('Getting ready to read your screenshot… This may take a moment the first time.');
       // A single worker processes images sequentially; superseded jobs cannot apply tags.
       const run = async () => {
-        if (token !== generation) return;
+        if (!isCurrent()) return;
         const worker = await getWorker();
         await recruitmentReady;
+        if (!isCurrent()) return;
         const tags = Object.values(TAG_MAP).filter(tag => tag.tagCat !== undefined);
         if (!tags.length) throw new Error('Recruitment data is unavailable. Reload and try again.');
-        const results = [];
+        const results = [], newEntries = [];
         for (let i = 0; i < boxes.length; i++) {
-          if (token !== generation) return;
+          if (!isCurrent()) return;
           progress(`Reading tag ${i + 1} of 5…`);
-          let match;
+          const binaryCrop = cropTag(bitmap, boxes[i], true);
+          const signature = live && tagCache.signature(binaryCrop.getContext('2d').getImageData(0, 0, binaryCrop.width, binaryCrop.height));
+          let match = !capture?.forceRecognition && signature && tagCache.get(signature);
+          if (match) {
+            results.push({ tagId: String(match.tagId), tagName: match.tagName, box: boxes[i] });
+            continue;
+          }
           for (const binary of [true, false]) {
-            const { data } = await worker.recognize(cropTag(bitmap, boxes[i], binary));
+            const { data } = await worker.recognize(binary ? binaryCrop : cropTag(bitmap, boxes[i], false));
+            if (!isCurrent()) return;
             match = RecruitVision.matchTag(data.text, tags);
-            if (match && data.confidence >= (match.exact ? 35 : 65)) break;
+            if (match && data.confidence >= (match.exact ? 35 : 65)) {
+              if (signature && binary && match.exact && data.confidence >= 65) newEntries.push({ signature, match });
+              break;
+            }
             match = null;
           }
           if (match) results.push({ tagId: String(match.tagId), tagName: match.tagName, box: boxes[i] });
         }
-        if (token !== generation) return;
+        if (!isCurrent()) return;
         if (results.length !== 5 || new Set(results.map(r => r.tagId)).size !== 5) {
           throw new Error(`Could only read ${new Set(results.map(r => r.tagId)).size} of the five tags. Your previous input is unchanged. Try a clearer screenshot, or turn Screenshot input off to choose the tags yourself.`);
         }
+        for (const entry of newEntries) tagCache.set(entry.signature, entry.match);
         const key = results.map(result => result.tagId).sort().join(',');
         const completedMessage = `Read 5/5 tags: ${(key === lastTagKey ? recognized : results).map(r => r.tagName).join(', ')}. ${live ? 'Screen share is on — new tags will be read automatically.' : 'To try another screenshot, copy it and click anywhere on the background.'}`;
         if (key === lastTagKey) {
@@ -203,6 +220,10 @@
           return true;
         }
         // Commit only a complete, different tag set; same tags never rebuild the UI.
+        // Encode a full screenshot only for a confirmed, different tag set.
+        const blob = capture ? await new Promise(resolve => bitmap.toBlob(resolve, 'image/png')) : input;
+        if (!isCurrent()) return;
+        if (!blob) throw new Error('Could not save the screenshot. Please try again.');
         const nextURL = URL.createObjectURL(blob);
         if (objectURL) URL.revokeObjectURL(objectURL);
         objectURL = nextURL;
@@ -230,11 +251,11 @@
       queue = queue.catch(() => {}).then(run);
       return await queue;
     } catch (error) {
-      if (token === generation) message(live
+      if (isCurrent()) message(live
         ? 'Could not read all five tags yet. Your previous input is unchanged — I’ll try again shortly.'
         : error.message || 'Could not read screenshot. Try Ctrl+V or turn Screenshot input off to select tags manually.');
       return false;
-    } finally { if (bitmap) bitmap.close(); }
+    } finally { if (!capture) bitmap?.close(); }
   }
 
   async function readClipboard() {
@@ -262,17 +283,18 @@
 
   const screenShare = RecruitScreenShare({
     button: document.getElementById('screenShareToggle'),
-    onRequest: () => { generation++; },
+    onRequest: () => { generation++; getWorker().catch(() => {}); },
     onStart: () => { setInputMode(true); },
-    onFrame: blob => processImage(blob, true),
+    onFrame: (snapshot, capture) => processImage(snapshot, true, capture),
     onMissing: message,
     onStop: () => { generation++; message('Screen share stopped. ' + (enabled ? pasteInstructions : 'Choose tags below, or turn Screenshot input on to paste a screenshot.')); },
     onStatus: message,
   });
 
   document.addEventListener('click', event => {
-    if (enabled && !screenShare.active && !event.target.closest(controls) && !window.getSelection()?.toString()) {
-      readClipboard();
+    if (enabled && !event.target.closest(controls) && !window.getSelection()?.toString()) {
+      if (screenShare.active) screenShare.refresh();
+      else readClipboard();
     }
   });
   document.addEventListener('paste', event => {
